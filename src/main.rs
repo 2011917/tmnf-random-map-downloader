@@ -8,12 +8,6 @@ use std::sync::mpsc::channel;
 use std::time::{Duration, Instant};
 
 // ==========================================
-// CONFIGURATION
-// ==========================================
-const REPLAY_FOLDER: &str = r"C:\Users\[YourName]\Documents\TmForever\Tracks\Replays\Autosaves";
-const DOWNLOAD_TARGET: &str = r"C:\Users\[YourName]\Desktop\TestTracks";
-
-// ==========================================
 // APP STATE & EVENTS
 // ==========================================
 enum AppEvent {
@@ -43,15 +37,31 @@ enum AppState {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let replay_folder = Path::new(REPLAY_FOLDER);
-    let target_folder = Path::new(DOWNLOAD_TARGET);
+    // ------------------------------------------
+    // NATIVE OS PATH RESOLUTION
+    // ------------------------------------------
+    // Safely asks Windows for the exact location of your Documents and Desktop folders
+    let replay_folder = dirs::document_dir()
+        .expect("❌ Could not find OS Documents folder")
+        .join("TmForever")
+        .join("Tracks")
+        .join("Replays")
+        .join("Autosaves");
+
+    let target_folder = dirs::desktop_dir()
+        .expect("❌ Could not find OS Desktop folder")
+        .join("TestTracks");
 
     if !replay_folder.exists() {
-        eprintln!("❌ [ERROR] Replay folder DOES NOT EXIST: {}", REPLAY_FOLDER);
+        eprintln!(
+            "❌ [ERROR] Replay folder DOES NOT EXIST: {}",
+            replay_folder.display()
+        );
+        eprintln!("Please check that TrackMania has created the Autosaves folder.");
         return Ok(());
     }
     if !target_folder.exists() {
-        std::fs::create_dir_all(target_folder)?;
+        std::fs::create_dir_all(&target_folder)?;
     }
 
     let (tx, rx) = channel::<AppEvent>();
@@ -60,6 +70,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // THREAD 1: File Watcher
     // ------------------------------------------
     let tx_watcher = tx.clone();
+
+    // NOTE: We must clone the path here so the watcher thread can own it
+    let watch_path = replay_folder.clone();
+
     let mut watcher = notify::recommended_watcher(move |res: NotifyResult<notify::Event>| {
         if let Ok(event) = res {
             for path in event.paths {
@@ -74,7 +88,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     })?;
-    watcher.watch(replay_folder, RecursiveMode::NonRecursive)?;
+
+    // Watch the resolved directory natively
+    watcher.watch(&watch_path, RecursiveMode::NonRecursive)?;
 
     // ------------------------------------------
     // THREAD 2: Keyboard Input Monitor
@@ -162,8 +178,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     _ => println!("Invalid option. Please enter 1, 2, or 3."),
                 },
                 AppState::RandomInfiniteMenu => match input.as_str() {
-                    "1" => start_gameplay(&mut state, PlayMode::BeatAuthor, None, target_folder),
-                    "2" => start_gameplay(&mut state, PlayMode::Grinding, None, target_folder),
+                    "1" => start_gameplay(&mut state, PlayMode::BeatAuthor, None, &target_folder),
+                    "2" => start_gameplay(&mut state, PlayMode::Grinding, None, &target_folder),
                     "3" => {
                         state = AppState::MainMenu;
                         print_main_menu();
@@ -172,13 +188,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
                 AppState::ChallengeMenu => match input.as_str() {
                     "1" => {
-                        start_gameplay(&mut state, PlayMode::BeatAuthor, Some(60), target_folder)
+                        start_gameplay(&mut state, PlayMode::BeatAuthor, Some(60), &target_folder)
                     }
                     "2" => {
-                        start_gameplay(&mut state, PlayMode::BeatAuthor, Some(30), target_folder)
+                        start_gameplay(&mut state, PlayMode::BeatAuthor, Some(30), &target_folder)
                     }
                     "3" => {
-                        start_gameplay(&mut state, PlayMode::BeatAuthor, Some(15), target_folder)
+                        start_gameplay(&mut state, PlayMode::BeatAuthor, Some(15), &target_folder)
                     }
                     "4" => {
                         state = AppState::ChallengeCustomTimeInput;
@@ -192,7 +208,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
                 AppState::ChallengeCustomTimeInput => {
                     if let Ok(mins) = input.parse::<u64>() {
-                        start_gameplay(&mut state, PlayMode::BeatAuthor, Some(mins), target_folder);
+                        start_gameplay(
+                            &mut state,
+                            PlayMode::BeatAuthor,
+                            Some(mins),
+                            &target_folder,
+                        );
                     } else {
                         println!("Invalid number. Returning to menu...");
                         state = AppState::ChallengeMenu;
@@ -201,7 +222,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 AppState::ChooseMapInput => {
                     println!("Downloading map {}...", input);
-                    match download_specific_map(&input, target_folder) {
+                    match download_specific_map(&input, &target_folder) {
                         Ok(_) => println!("✅ Map loaded! Returning to main menu.\n"),
                         Err(e) => println!("❌ Error: {}\nReturning to main menu.\n", e),
                     }
@@ -211,7 +232,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 AppState::Playing { .. } => match input.as_str() {
                     "1" => {
                         println!("\n⏭️ Skipping map... Fetching new map...");
-                        match download_random_map(target_folder) {
+                        match download_random_map(&target_folder) {
                             Ok(time) => {
                                 if let AppState::Playing {
                                     current_author_time,
@@ -283,7 +304,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 println!("\n🏆 AUTHOR MEDAL BEAT! (Maps Beaten: {})", maps_beaten);
                                 println!("Downloading next map...");
 
-                                match download_random_map(target_folder) {
+                                match download_random_map(&target_folder) {
                                     Ok(new_time) => {
                                         *current_author_time = new_time;
                                         print_playing_instructions(
