@@ -1126,7 +1126,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "tm_randomizer"
+name = "tm_random_map"
 version = "0.1.0"
 dependencies = [
  "notify",

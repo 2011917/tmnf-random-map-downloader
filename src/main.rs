@@ -7,23 +7,58 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::channel;
 use std::time::{Duration, Instant};
 
+// ==========================================
+// CONFIGURATION
+// ==========================================
+const REPLAY_FOLDER: &str = r"C:\Users\[YourName]\Documents\TmForever\Tracks\Replays\Autosaves";
+const DOWNLOAD_TARGET: &str = r"C:\Users\[YourName]\Desktop\TestTracks";
+
+// ==========================================
+// APP STATE & EVENTS
+// ==========================================
 enum AppEvent {
+    Input(String),
     FileActivity(PathBuf),
-    SkipRequested,
+}
+
+#[derive(Clone, PartialEq)]
+enum PlayMode {
+    BeatAuthor,
+    Grinding,
+}
+
+#[derive(Clone)]
+enum AppState {
+    MainMenu,
+    RandomInfiniteMenu,
+    ChallengeMenu,
+    ChallengeCustomTimeInput,
+    ChooseMapInput,
+    Playing {
+        mode: PlayMode,
+        current_author_time: i32,
+        challenge_end: Option<Instant>,
+        maps_beaten: u32,
+    },
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let replay_folder = r"C:\Users\[username]\Documents\TmForever\Tracks\Replays\Autosaves";
-    let download_target = r"C:\Users\[username]\Desktop\TestTracks";
+    let replay_folder = Path::new(REPLAY_FOLDER);
+    let target_folder = Path::new(DOWNLOAD_TARGET);
 
-    println!("--- TrackMania Randomizer Bot Started ---");
-    println!("Monitoring for file activity in: {}", replay_folder);
-    println!("Type 's' and press Enter to skip a map.");
-    println!("-----------------------------------------\n");
+    if !replay_folder.exists() {
+        eprintln!("❌ [ERROR] Replay folder DOES NOT EXIST: {}", REPLAY_FOLDER);
+        return Ok(());
+    }
+    if !target_folder.exists() {
+        std::fs::create_dir_all(target_folder)?;
+    }
 
     let (tx, rx) = channel::<AppEvent>();
 
-    // PRODUCER 1: File Watcher
+    // ------------------------------------------
+    // THREAD 1: File Watcher
+    // ------------------------------------------
     let tx_watcher = tx.clone();
     let mut watcher = notify::recommended_watcher(move |res: NotifyResult<notify::Event>| {
         if let Ok(event) = res {
@@ -39,152 +74,393 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     })?;
-    watcher.watch(Path::new(replay_folder), RecursiveMode::NonRecursive)?;
+    watcher.watch(replay_folder, RecursiveMode::NonRecursive)?;
 
-    // PRODUCER 2: Keyboard Monitor
+    // ------------------------------------------
+    // THREAD 2: Keyboard Input Monitor
+    // ------------------------------------------
     let tx_stdin = tx.clone();
     std::thread::spawn(move || {
         let stdin = std::io::stdin();
-        let mut input = String::new();
         loop {
-            input.clear();
+            let mut input = String::new();
             if stdin.read_line(&mut input).is_ok() {
-                if input.trim().eq_ignore_ascii_case("s") {
-                    let _ = tx_stdin.send(AppEvent::SkipRequested);
+                let trimmed = input.trim().to_string();
+                if !trimmed.is_empty() {
+                    let _ = tx_stdin.send(AppEvent::Input(trimmed));
                 }
             }
         }
     });
 
-    // --- STATE TRACKING ---
-    let mut current_author_time: i32 = 0;
+    // ------------------------------------------
+    // MAIN THREAD: State Machine
+    // ------------------------------------------
+    let mut state = AppState::MainMenu;
     let mut recent_files: HashMap<String, Instant> = HashMap::new();
+    let mut last_cleanup = Instant::now();
 
-    // STARTUP
-    println!("Fetching initial map...");
-    match download_next_map(download_target) {
-        Ok(time) => current_author_time = time,
-        Err(e) => eprintln!(
-            "Failed to download initial map: {}. Type 's' to try again.",
-            e
-        ),
-    }
+    print_main_menu();
 
-    // MAIN LOOP
-    for app_event in rx {
-        match app_event {
-            AppEvent::FileActivity(path) => {
-                // Anti-Spam: Ignore this file if we already processed it in the last 5 seconds
-                let filename = path
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string();
-                if let Some(&last_seen) = recent_files.get(&filename) {
-                    if last_seen.elapsed().as_secs() < 5 {
-                        continue;
-                    }
-                }
+    loop {
+        // Clear spam memory every 10 seconds
+        if last_cleanup.elapsed().as_secs() > 10 {
+            recent_files.clear();
+            last_cleanup = Instant::now();
+        }
 
-                // Record that we are processing this file now
-                recent_files.insert(filename, Instant::now());
-
-                // Give TM a second to finish writing the file to disk
-                std::thread::sleep(Duration::from_millis(1000));
-
-                if current_author_time == 0 {
-                    println!("A replay was saved, but no active author time is set. Skipping.");
+        // Determine if we need a timeout loop (for the Challenge Mode timer)
+        let timeout = match state {
+            AppState::Playing {
+                challenge_end: Some(end),
+                maps_beaten,
+                ..
+            } => {
+                let now = Instant::now();
+                if now >= end {
+                    println!("\n⏰ CHALLENGE OVER! ⏰");
+                    println!("🏆 Total Maps Beaten: {}\n", maps_beaten);
+                    state = AppState::MainMenu;
+                    print_main_menu();
                     continue;
-                }
-
-                // Read the Replay file to get your time
-                match get_replay_best_time(&path) {
-                    Ok(best_time) => {
-                        println!(
-                            "   -> Your Time: {}, Author Target: {}",
-                            best_time, current_author_time
-                        );
-
-                        if best_time <= current_author_time && best_time > 0 {
-                            println!("\n🏆 Author Medal beat! Downloading next map...");
-                            match download_next_map(download_target) {
-                                Ok(time) => current_author_time = time,
-                                Err(e) => eprintln!("Failed to download next map: {}", e),
-                            }
-                        } else {
-                            println!("❌ Close, but not quite! Keep trying.");
-                        }
-                    }
-                    Err(e) => eprintln!("Error reading replay file: {}", e),
+                } else {
+                    Some(Duration::from_millis(500))
                 }
             }
-            AppEvent::SkipRequested => {
-                println!("\n⏭️ Skip requested! Downloading next map...");
-                match download_next_map(download_target) {
-                    Ok(time) => current_author_time = time,
-                    Err(e) => eprintln!("Failed to download map: {}", e),
+            _ => None,
+        };
+
+        // Wait for event or timeout
+        let event = if let Some(t) = timeout {
+            rx.recv_timeout(t).ok()
+        } else {
+            rx.recv().ok()
+        };
+
+        if event.is_none() {
+            continue; // Timeout triggered, loop around to check timer again
+        }
+
+        match event.unwrap() {
+            // ==========================================
+            // KEYBOARD INPUT HANDLING
+            // ==========================================
+            AppEvent::Input(input) => match state.clone() {
+                AppState::MainMenu => match input.as_str() {
+                    "1" => {
+                        state = AppState::RandomInfiniteMenu;
+                        print_random_infinite_menu();
+                    }
+                    "2" => {
+                        state = AppState::ChallengeMenu;
+                        print_challenge_menu();
+                    }
+                    "3" => {
+                        state = AppState::ChooseMapInput;
+                        println!("\nEnter TM Exchange Map Code:");
+                    }
+                    _ => println!("Invalid option. Please enter 1, 2, or 3."),
+                },
+                AppState::RandomInfiniteMenu => match input.as_str() {
+                    "1" => start_gameplay(&mut state, PlayMode::BeatAuthor, None, target_folder),
+                    "2" => start_gameplay(&mut state, PlayMode::Grinding, None, target_folder),
+                    "3" => {
+                        state = AppState::MainMenu;
+                        print_main_menu();
+                    }
+                    _ => println!("Invalid option. Please enter 1, 2, or 3."),
+                },
+                AppState::ChallengeMenu => match input.as_str() {
+                    "1" => {
+                        start_gameplay(&mut state, PlayMode::BeatAuthor, Some(60), target_folder)
+                    }
+                    "2" => {
+                        start_gameplay(&mut state, PlayMode::BeatAuthor, Some(30), target_folder)
+                    }
+                    "3" => {
+                        start_gameplay(&mut state, PlayMode::BeatAuthor, Some(15), target_folder)
+                    }
+                    "4" => {
+                        state = AppState::ChallengeCustomTimeInput;
+                        println!("\nEnter whole number of minutes:");
+                    }
+                    "5" => {
+                        state = AppState::MainMenu;
+                        print_main_menu();
+                    }
+                    _ => println!("Invalid option. Please enter 1-5."),
+                },
+                AppState::ChallengeCustomTimeInput => {
+                    if let Ok(mins) = input.parse::<u64>() {
+                        start_gameplay(&mut state, PlayMode::BeatAuthor, Some(mins), target_folder);
+                    } else {
+                        println!("Invalid number. Returning to menu...");
+                        state = AppState::ChallengeMenu;
+                        print_challenge_menu();
+                    }
+                }
+                AppState::ChooseMapInput => {
+                    println!("Downloading map {}...", input);
+                    match download_specific_map(&input, target_folder) {
+                        Ok(_) => println!("✅ Map loaded! Returning to main menu.\n"),
+                        Err(e) => println!("❌ Error: {}\nReturning to main menu.\n", e),
+                    }
+                    state = AppState::MainMenu;
+                    print_main_menu();
+                }
+                AppState::Playing { .. } => match input.as_str() {
+                    "1" => {
+                        println!("\n⏭️ Skipping map... Fetching new map...");
+                        match download_random_map(target_folder) {
+                            Ok(time) => {
+                                if let AppState::Playing {
+                                    current_author_time,
+                                    maps_beaten,
+                                    challenge_end,
+                                    ..
+                                } = &mut state
+                                {
+                                    *current_author_time = time;
+                                    print_playing_instructions(
+                                        *current_author_time,
+                                        *challenge_end,
+                                        *maps_beaten,
+                                    );
+                                }
+                            }
+                            Err(e) => println!("Failed to skip: {}", e),
+                        }
+                    }
+                    "2" => {
+                        println!("\nReturning to Main Menu...\n");
+                        state = AppState::MainMenu;
+                        print_main_menu();
+                    }
+                    _ => println!("Invalid command. Type '1' to Skip, or '2' for Main Menu."),
+                },
+            },
+
+            // ==========================================
+            // REPLAY FILE HANDLING
+            // ==========================================
+            AppEvent::FileActivity(path) => {
+                if let AppState::Playing {
+                    mode,
+                    current_author_time,
+                    maps_beaten,
+                    challenge_end,
+                } = &mut state
+                {
+                    // Anti-Spam Check
+                    let filename = path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string();
+                    if let Some(&last_seen) = recent_files.get(&filename) {
+                        if last_seen.elapsed().as_secs() < 5 {
+                            continue;
+                        }
+                    }
+                    recent_files.insert(filename, Instant::now());
+
+                    // Let TM finish writing to disk
+                    std::thread::sleep(Duration::from_millis(1000));
+
+                    match get_replay_best_time(&path) {
+                        Ok(best_time) => {
+                            println!(
+                                "   -> Your Time: {} | Target: {}",
+                                format_time(best_time),
+                                format_time(*current_author_time)
+                            );
+
+                            if *mode == PlayMode::BeatAuthor
+                                && best_time <= *current_author_time
+                                && best_time > 0
+                            {
+                                *maps_beaten += 1;
+                                println!("\n🏆 AUTHOR MEDAL BEAT! (Maps Beaten: {})", maps_beaten);
+                                println!("Downloading next map...");
+
+                                match download_random_map(target_folder) {
+                                    Ok(new_time) => {
+                                        *current_author_time = new_time;
+                                        print_playing_instructions(
+                                            *current_author_time,
+                                            *challenge_end,
+                                            *maps_beaten,
+                                        );
+                                    }
+                                    Err(e) => println!("Download failed: {}", e),
+                                }
+                            } else if *mode == PlayMode::BeatAuthor {
+                                println!("❌ Not quite! Keep trying.");
+                            } else if *mode == PlayMode::Grinding {
+                                println!("🔥 Keep grinding! (1 to skip map, 2 for menu)");
+                            }
+                        }
+                        Err(e) => eprintln!("Error parsing replay: {}", e),
+                    }
                 }
             }
         }
     }
-
-    Ok(())
 }
 
-/// Reads the .Replay.Gbx file to find the player's time
-fn get_replay_best_time(path: &Path) -> Result<i32, Box<dyn std::error::Error>> {
-    let bytes = fs::read(path)?;
-    let content = String::from_utf8_lossy(&bytes);
+// ==========================================
+// HELPERS & NETWORK FUNCTIONS
+// ==========================================
 
-    let re_best = Regex::new(r#"best="(\d+)""#)?;
-
-    let best_time = re_best
-        .captures(&content)
-        .and_then(|cap| cap.get(1))
-        .ok_or("Best time not found in replay file. Game may still be writing it.")?
-        .as_str()
-        .parse::<i32>()?;
-
-    Ok(best_time)
+fn start_gameplay(state: &mut AppState, mode: PlayMode, minutes: Option<u64>, target: &Path) {
+    println!("\nFetching map...");
+    match download_random_map(target) {
+        Ok(time) => {
+            let challenge_end = minutes.map(|m| Instant::now() + Duration::from_secs(m * 60));
+            *state = AppState::Playing {
+                mode,
+                current_author_time: time,
+                challenge_end,
+                maps_beaten: 0,
+            };
+            print_playing_instructions(time, challenge_end, 0);
+        }
+        Err(e) => {
+            println!("❌ Failed to download map: {}. Returning to menu.", e);
+            *state = AppState::MainMenu;
+            print_main_menu();
+        }
+    }
 }
 
-/// Downloads the map, parses the map file for the Author Time, and returns it
-fn download_next_map(target_folder: &str) -> Result<i32, Box<dyn std::error::Error>> {
-    // 1. Get a random track ID
-    let response = reqwest::blocking::get("https://tmnf.exchange/trackrandom")?;
-    let track_id = response.url().as_str().split('/').last().unwrap();
+fn download_random_map(target_folder: &Path) -> Result<i32, String> {
+    let response = reqwest::blocking::get("https://tmnf.exchange/trackrandom")
+        .map_err(|e| format!("Network error: {}", e))?;
+    let final_url = response.url().as_str();
+    let track_id = final_url.split('/').last().unwrap_or("").to_string();
 
-    // 2. Download the track file
+    if track_id.is_empty() {
+        return Err("Failed to extract random track ID".into());
+    }
+
+    download_specific_map(&track_id, target_folder)
+}
+
+fn download_specific_map(track_id: &str, target_folder: &Path) -> Result<i32, String> {
     let download_url = format!("https://tmnf.exchange/trackgbx/{}", track_id);
-    let response = reqwest::blocking::get(&download_url)?;
+    let response =
+        reqwest::blocking::get(&download_url).map_err(|e| format!("Network error: {}", e))?;
 
-    // We grab the raw bytes into memory so we can both save it AND read it
-    let bytes = response.bytes()?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "Map {} not found on TMX (HTTP {})",
+            track_id,
+            response.status()
+        ));
+    }
 
-    // 3. Save it to disk
-    let file_path = Path::new(target_folder).join(format!("next_map_{}.gbx", track_id));
-    let mut file = std::fs::File::create(&file_path)?;
-    let mut content = Cursor::new(bytes.clone());
-    std::io::copy(&mut content, &mut file)?;
+    let bytes = response
+        .bytes()
+        .map_err(|e| format!("Failed to read bytes: {}", e))?;
 
-    // 4. Extract the Author time from the newly downloaded map file
+    // Extract author time
     let content_str = String::from_utf8_lossy(&bytes);
-    let re_author = Regex::new(r#"authortime="(\d+)""#)?;
+    let re_author = Regex::new(r#"authortime="(\d+)""#).unwrap();
 
     let author_time = re_author
         .captures(&content_str)
         .and_then(|cap| cap.get(1))
-        .ok_or("Author time not found in downloaded map file")?
+        .ok_or("Author time not found in map file header")?
         .as_str()
-        .parse::<i32>()?;
+        .parse::<i32>()
+        .map_err(|_| "Failed to parse author time")?;
 
-    println!(
-        "Downloaded Map ID {}. Target to beat: {} ms",
-        track_id, author_time
-    );
+    // Save and open
+    let file_path = target_folder.join(format!("map_{}.gbx", track_id));
+    let mut file =
+        std::fs::File::create(&file_path).map_err(|e| format!("Failed to create file: {}", e))?;
+    let mut cursor = Cursor::new(bytes.clone());
+    std::io::copy(&mut cursor, &mut file).map_err(|e| format!("Failed to write file: {}", e))?;
 
-    // 5. Open it in-game
-    opener::open(&file_path)?;
+    opener::open(&file_path).map_err(|e| format!("Failed to open map in game: {}", e))?;
 
     Ok(author_time)
+}
+
+fn get_replay_best_time(path: &Path) -> Result<i32, String> {
+    let bytes = fs::read(path).map_err(|e| e.to_string())?;
+    let content = String::from_utf8_lossy(&bytes);
+
+    let re_best = Regex::new(r#"best="(\d+)""#).unwrap();
+    let best_time = re_best
+        .captures(&content)
+        .and_then(|cap| cap.get(1))
+        .ok_or("Best time not found in replay file. Game may still be writing.")?
+        .as_str()
+        .parse::<i32>()
+        .map_err(|_| "Failed to parse best time")?;
+
+    Ok(best_time)
+}
+
+fn format_time(ms: i32) -> String {
+    let seconds = ms / 1000;
+    let millis = ms % 1000;
+    format!("{}.{:03}s", seconds, millis)
+}
+
+// ==========================================
+// UI MENUS
+// ==========================================
+
+fn print_main_menu() {
+    println!("\n==================================");
+    println!("          MAIN MENU");
+    println!("==================================");
+    println!("1: Random Infinite");
+    println!("2: Random Map Challenge");
+    println!("3: Choose map to download");
+    println!("----------------------------------");
+    println!("Enter selection (1-3):");
+}
+
+fn print_random_infinite_menu() {
+    println!("\n==================================");
+    println!("       RANDOM INFINITE");
+    println!("==================================");
+    println!("1: Beat Author Time (Auto-skips on win)");
+    println!("2: Infinite Grinding (No auto-skips)");
+    println!("3: Back to Main Menu");
+    println!("----------------------------------");
+    println!("Enter selection (1-3):");
+}
+
+fn print_challenge_menu() {
+    println!("\n==================================");
+    println!("      RANDOM MAP CHALLENGE");
+    println!("==================================");
+    println!("1: 1 Hour");
+    println!("2: 30 Minutes");
+    println!("3: 15 Minutes");
+    println!("4: Custom (Enter minutes)");
+    println!("5: Back to Main Menu");
+    println!("----------------------------------");
+    println!("Select time (1-5):");
+}
+
+fn print_playing_instructions(author_time: i32, end_time: Option<Instant>, maps_beaten: u32) {
+    println!("\n==================================");
+    println!("🎯 TARGET AUTHOR TIME: {}", format_time(author_time));
+    if let Some(end) = end_time {
+        let remaining = end.duration_since(Instant::now()).as_secs();
+        println!(
+            "⏱️  TIME REMAINING: {}m {}s",
+            remaining / 60,
+            remaining % 60
+        );
+        println!("🏅 Maps Beaten: {}", maps_beaten);
+    }
+    println!("----------------------------------");
+    println!("Type '1' to Skip Map | Type '2' for Main Menu");
+    println!("==================================\n");
 }
