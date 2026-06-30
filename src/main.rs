@@ -1,3 +1,4 @@
+use directories::UserDirs;
 use notify::{RecursiveMode, Result as NotifyResult, Watcher};
 use regex::Regex;
 use std::collections::HashMap;
@@ -39,19 +40,30 @@ enum AppState {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // ------------------------------------------
-    // NATIVE OS PATH RESOLUTION
-    // ------------------------------------------
-    let replay_folder = dirs::document_dir()
-        .expect("❌ Could not find OS Documents folder")
+    // 1. Get the system's home directory dynamically
+    let user_dirs = UserDirs::new().expect("Could not find user home directory");
+    let home_dir = user_dirs.home_dir();
+
+    // 2. Build the Replay path using the dynamic home_dir
+    // This resolves to: C:\Users\<CurrentUsername>\AppData\Local\VirtualStore\...
+    let replay_folder = home_dir
+        .join("AppData")
+        .join("Local")
+        .join("VirtualStore")
+        .join("Program Files (x86)")
+        .join("TmNationsForever")
         .join("TmForever")
         .join("Tracks")
         .join("Replays")
         .join("Autosaves");
 
-    let target_folder = dirs::desktop_dir()
-        .expect("❌ Could not find OS Desktop folder")
+    // 3. Build the Target path (Desktop) dynamically
+    let target_folder = user_dirs
+        .desktop_dir()
+        .expect("Could not find Desktop")
         .join("TestTracks");
+
+    // ... continue with the rest of your logic
 
     if !replay_folder.exists() {
         eprintln!(

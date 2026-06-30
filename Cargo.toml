@@ -1,5 +1,5 @@
 [package]
-name = "tm_random_map"
+name = "rmc"
 version = "0.1.0"
 edition = "2021"
 
@@ -9,3 +9,4 @@ regex = "1.10.0"
 reqwest = { version = "0.11", features = ["blocking"] }
 opener = "0.6.1"
 dirs = "5.0.1"
+directories = "6.0"
