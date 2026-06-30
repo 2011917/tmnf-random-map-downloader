@@ -30,9 +30,11 @@ enum AppState {
     ChooseMapInput,
     Playing {
         mode: PlayMode,
+        current_track_id: String,
         current_author_time: i32,
         challenge_end: Option<Instant>,
         maps_beaten: u32,
+        last_replay_path: Option<PathBuf>,
     },
 }
 
@@ -40,7 +42,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ------------------------------------------
     // NATIVE OS PATH RESOLUTION
     // ------------------------------------------
-    // Safely asks Windows for the exact location of your Documents and Desktop folders
     let replay_folder = dirs::document_dir()
         .expect("❌ Could not find OS Documents folder")
         .join("TmForever")
@@ -70,8 +71,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // THREAD 1: File Watcher
     // ------------------------------------------
     let tx_watcher = tx.clone();
-
-    // NOTE: We must clone the path here so the watcher thread can own it
     let watch_path = replay_folder.clone();
 
     let mut watcher = notify::recommended_watcher(move |res: NotifyResult<notify::Event>| {
@@ -89,7 +88,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     })?;
 
-    // Watch the resolved directory natively
     watcher.watch(&watch_path, RecursiveMode::NonRecursive)?;
 
     // ------------------------------------------
@@ -229,21 +227,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     state = AppState::MainMenu;
                     print_main_menu();
                 }
-                AppState::Playing { .. } => match input.as_str() {
+                AppState::Playing {
+                    current_track_id,
+                    last_replay_path,
+                    ..
+                } => match input.as_str() {
                     "1" => {
                         println!("\n⏭️ Skipping map... Fetching new map...");
                         match download_random_map(&target_folder) {
-                            Ok(time) => {
+                            Ok((new_track_id, new_time)) => {
                                 if let AppState::Playing {
-                                    current_author_time,
+                                    current_track_id: ref mut tid,
+                                    current_author_time: ref mut at,
+                                    last_replay_path: ref mut lrp,
                                     maps_beaten,
                                     challenge_end,
                                     ..
                                 } = &mut state
                                 {
-                                    *current_author_time = time;
+                                    *tid = new_track_id;
+                                    *at = new_time;
+                                    *lrp = None;
                                     print_playing_instructions(
-                                        *current_author_time,
+                                        *at,
                                         *challenge_end,
                                         *maps_beaten,
                                     );
@@ -257,7 +263,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         state = AppState::MainMenu;
                         print_main_menu();
                     }
-                    _ => println!("Invalid command. Type '1' to Skip, or '2' for Main Menu."),
+                    "9" => {
+                        println!("\n🚀 Attempting to upload your last replay...");
+                        if let Some(path) = last_replay_path {
+                            upload_replay_to_tmx(&path, &current_track_id);
+                        } else {
+                            println!("❌ No replay found yet! Finish a run to generate an autosave first.");
+                        }
+                    }
+                    _ => println!("Invalid command. Type '1' to Skip, '2' for Main Menu, or '9' to Upload Replay."),
                 },
             },
 
@@ -267,9 +281,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             AppEvent::FileActivity(path) => {
                 if let AppState::Playing {
                     mode,
+                    current_track_id,
                     current_author_time,
                     maps_beaten,
                     challenge_end,
+                    last_replay_path,
                 } = &mut state
                 {
                     // Anti-Spam Check
@@ -284,6 +300,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                     recent_files.insert(filename, Instant::now());
+
+                    // SAVE THE NEWEST REPLAY PATH
+                    *last_replay_path = Some(path.clone());
 
                     // Let TM finish writing to disk
                     std::thread::sleep(Duration::from_millis(1000));
@@ -305,8 +324,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 println!("Downloading next map...");
 
                                 match download_random_map(&target_folder) {
-                                    Ok(new_time) => {
+                                    Ok((new_track_id, new_time)) => {
+                                        *current_track_id = new_track_id;
                                         *current_author_time = new_time;
+                                        *last_replay_path = None;
                                         print_playing_instructions(
                                             *current_author_time,
                                             *challenge_end,
@@ -318,7 +339,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             } else if *mode == PlayMode::BeatAuthor {
                                 println!("❌ Not quite! Keep trying.");
                             } else if *mode == PlayMode::Grinding {
-                                println!("🔥 Keep grinding! (1 to skip map, 2 for menu)");
+                                println!("🔥 Keep grinding! ('1' skip, '2' menu, '9' upload)");
                             }
                         }
                         Err(e) => eprintln!("Error parsing replay: {}", e),
@@ -336,13 +357,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn start_gameplay(state: &mut AppState, mode: PlayMode, minutes: Option<u64>, target: &Path) {
     println!("\nFetching map...");
     match download_random_map(target) {
-        Ok(time) => {
+        Ok((track_id, time)) => {
             let challenge_end = minutes.map(|m| Instant::now() + Duration::from_secs(m * 60));
             *state = AppState::Playing {
                 mode,
+                current_track_id: track_id,
                 current_author_time: time,
                 challenge_end,
                 maps_beaten: 0,
+                last_replay_path: None,
             };
             print_playing_instructions(time, challenge_end, 0);
         }
@@ -354,7 +377,7 @@ fn start_gameplay(state: &mut AppState, mode: PlayMode, minutes: Option<u64>, ta
     }
 }
 
-fn download_random_map(target_folder: &Path) -> Result<i32, String> {
+fn download_random_map(target_folder: &Path) -> Result<(String, i32), String> {
     let response = reqwest::blocking::get("https://tmnf.exchange/trackrandom")
         .map_err(|e| format!("Network error: {}", e))?;
     let final_url = response.url().as_str();
@@ -364,7 +387,8 @@ fn download_random_map(target_folder: &Path) -> Result<i32, String> {
         return Err("Failed to extract random track ID".into());
     }
 
-    download_specific_map(&track_id, target_folder)
+    let time = download_specific_map(&track_id, target_folder)?;
+    Ok((track_id, time))
 }
 
 fn download_specific_map(track_id: &str, target_folder: &Path) -> Result<i32, String> {
@@ -430,6 +454,43 @@ fn format_time(ms: i32) -> String {
     format!("{}.{:03}s", seconds, millis)
 }
 
+fn upload_replay_to_tmx(replay_path: &Path, track_id: &str) {
+    println!("🌐 TMX requires session authentication (Ubisoft Connect) to submit records.");
+    println!("Opening the TMX map page for you...");
+    println!("📁 File ready for upload: {}", replay_path.display());
+
+    let upload_url = format!("https://tmnf.exchange/trackshow/{}", track_id);
+    if let Err(e) = opener::open(&upload_url) {
+        println!("❌ Failed to open browser: {}", e);
+    }
+
+    /* // ==========================================
+    // HARDCODED DIRECT UPLOAD (Requires manual cookie extraction)
+    // ==========================================
+    // If you extract your TMX session cookie from your browser, you can use this snippet
+    // to bypass the browser entirely. WARNING: Cookies expire, so this requires maintenance.
+
+    // let cookie = "YOUR_PHPSESSID_OR_TMX_COOKIE_HERE";
+    // let upload_endpoint = format!("https://tmnf.exchange/replay/upload/{}", track_id);
+    //
+    // let form = reqwest::blocking::multipart::Form::new()
+    //     .file("replay_file", replay_path)
+    //     .expect("Failed to read replay file");
+    //
+    // let client = reqwest::blocking::Client::new();
+    // let res = client.post(&upload_endpoint)
+    //     .header(reqwest::header::COOKIE, cookie)
+    //     .multipart(form)
+    //     .send();
+    //
+    // match res {
+    //     Ok(response) if response.status().is_success() => println!("✅ Upload successful!"),
+    //     Ok(response) => println!("⚠️ Upload failed with status: {}", response.status()),
+    //     Err(e) => println!("❌ Network error during upload: {}", e),
+    // }
+    */
+}
+
 // ==========================================
 // UI MENUS
 // ==========================================
@@ -482,6 +543,6 @@ fn print_playing_instructions(author_time: i32, end_time: Option<Instant>, maps_
         println!("🏅 Maps Beaten: {}", maps_beaten);
     }
     println!("----------------------------------");
-    println!("Type '1' to Skip Map | Type '2' for Main Menu");
+    println!("Type '1' to Skip Map | '2' for Main Menu | '9' to Upload Replay");
     println!("==================================\n");
 }
